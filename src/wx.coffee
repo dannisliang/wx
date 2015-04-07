@@ -619,6 +619,9 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
           wx.user message.from_user_name, (err, user) ->
             if err
               console.error err
+              if err.errcode == 40001 || err.errcode == 42001
+                 redis_client.del 'WX:ACCESS_TOKEN'
+                 fetch_access_token()
               return res.status(500).end()
             process_message user
 
