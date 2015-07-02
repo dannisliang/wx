@@ -517,7 +517,7 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
                   res.status(500).end()
                 else res.ok()
 
-            # 收到图片、语音、视频、地理位置、链接时，如注册了处理句柄，使用该句柄处理：
+            # 收到图片、语音、视频、地理位置、链接时，设备消息，如注册了处理句柄，使用该句柄处理：
             when 'image', 'voice', 'video', 'location', 'link', 'device_text'
               async.eachSeries (@["#{msg_type}_handlers"] or []), (handler, callback) ->
                 handler req, res, callback
@@ -611,6 +611,16 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
                       res.status(500).end()
                     else res.ok()
 
+                # 卡券 审核通过，审核未通过，用户领取卡券，用户删除卡券，核销卡券，进入会员卡，用户从卡券进入公众号会话
+                when 'card_pass_check', 'card_not_pass_check', 'user_get_card', 'user_del_card', 'user_consume_card', 'user_view_card', 'user_enter_session_from_card'
+                  async.eachSeries (@card_handlers or []), (handler, callback) ->
+                    handler req, res, callback
+                  , (err) ->
+                    if err
+                      console.error err
+                      res.status(500).end()
+                    else res.ok()
+                    
                 # 尚无法处理的事件，直接响应`200`。
                 else res.ok()
 
@@ -992,6 +1002,9 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
     # ### 注册关注与取消关注处理句柄
     subscribe   :   (@subscribe_handlers...) => @
     unsubscribe : (@unsubscribe_handlers...) => @
+
+    # ### 注册卡券消息处理句柄
+    card: (@card_handlers...) => @
 
     # ### 注册模板消息处理句柄
     templatesendjobfinish: (@templatesendjobfinish_handlers...) => @
