@@ -14,7 +14,6 @@ getRawBody = require 'raw-body'
 xml2js     = require 'xml2js'
 express    = require 'express'
 async      = require 'async'
-base64     = require 'base64'
 
 # ### 接口地址
 #
@@ -32,6 +31,7 @@ api_binary = 'http://file.api.weixin.qq.com/cgi-bin'
 #   - `token`
 #   - `app_id`
 #   - `app_secret`
+#   - `encoding_aes_key` （若提供则使用加密方式）
 #
 # + `redis`：`REDIS`连接参数（默认本地连接），包含：
 #
@@ -41,7 +41,7 @@ api_binary = 'http://file.api.weixin.qq.com/cgi-bin'
 #
 # + `populate_user`：是否自动组装用户信息，默认`on`；
 # + `debug`：调试模式，输出调试信息。
-module.exports = ({token, app_id, app_secret, redis_options, populate_user, debug}) ->
+module.exports = ({token, app_id, app_secret, encoding_aes_key, redis_options, populate_user, debug}) ->
 
   # ### REDIS客户端
   #
@@ -55,6 +55,11 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
 
   # 访问口令局部缓存。
   access_token = null
+
+  # 消息加密解密器
+  if encoding_aes_key
+    WXMsgCrypt = require './wx-msg-crypt'
+    wx_msg_crypt = new WXMsgCrypt token, encoding_aes_key, app_id
 
   #（默认）响应消息前，先通过微信接口组装用户信息。
   populate_user ?= on
@@ -93,13 +98,14 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
   # + `WX:SEND:DESKTOP`：在另外进程模拟的发送桌面端响应。
   #
   # 消息内容均为`JSON`格式。
-  redis_pubsub.subscribe 'WX:ACCESS_TOKEN', 'WX:SCAN:TEMPORARY', 'WX:SEND:MOBILE', 'WX:SEND:DESKTOP'
+  key_access_token = "WX:ACCESS_TOKEN:#{app_id}"
+  redis_pubsub.subscribe key_access_token, 'WX:SCAN:TEMPORARY', 'WX:SEND:MOBILE', 'WX:SEND:DESKTOP'
   redis_pubsub.on 'message', (channel, message) =>
     message = JSON.parse "#{message}"
     switch channel
 
       # `ACCESS_TOKEN`事件时：更新访问口令局部缓存：
-      when 'WX:ACCESS_TOKEN' then access_token = message
+      when key_access_token then access_token = message
 
       # `WX:SCAN:TEMPORARY`事件时：
       when 'WX:SCAN:TEMPORARY'
@@ -180,9 +186,9 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
   # ### 获取访问令牌
   lock_fetching = 5
   do fetch_access_token = =>
-    redis_client.watch 'WX:ACCESS_TOKEN'
-    redis_client.ttl 'WX:ACCESS_TOKEN', (err, ttl) =>
-      redis_client.get 'WX:ACCESS_TOKEN', (err, _access_token) =>
+    redis_client.watch key_access_token
+    redis_client.ttl key_access_token, (err, ttl) =>
+      redis_client.get key_access_token, (err, _access_token) =>
         if ttl > lock_fetching
           redis_client.multi().exec (err, multi_res) =>
             return fetch_access_token() unless multi_res
@@ -190,7 +196,7 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
             setTimeout fetch_access_token, (ttl - lock_fetching) * 1000
         else if "#{_access_token}" not in ['FETCHING']
           redis_client.multi()
-          .setex('WX:ACCESS_TOKEN', lock_fetching, 'FETCHING')
+          .setex(key_access_token, lock_fetching, 'FETCHING')
           .exec (err, multi_res) =>
             return fetch_access_token() unless multi_res
 
@@ -207,11 +213,11 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
               # 存在错误代码时，控制台提示，删除令牌。
               if res.body.errcode
                 console.error '微信认证失败，登录微信公共平台获取开发者凭据 https://mp.weixin.qq.com'
-                redis_client.del 'WX:ACCESS_TOKEN'
+                redis_client.del key_access_token
               else
                 {access_token: _access_token, expires_in} = res.body
-                redis_client.setex 'WX:ACCESS_TOKEN', expires_in, _access_token
-                redis_client.publish 'WX:ACCESS_TOKEN', JSON.stringify _access_token
+                redis_client.setex key_access_token, expires_in, _access_token
+                redis_client.publish key_access_token, JSON.stringify _access_token
                 setTimeout fetch_access_token, (expires_in - lock_fetching) * 1000
         else setTimeout fetch_access_token, ttl * 1000
 
@@ -385,7 +391,7 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
       console.info string if debug
 
       # 2. 解析请求XML内容。
-      xml2js.parseString string, (err, result) =>
+      callback = (err, result) =>
         return res.status(400).end() if err
 
         # 3. 按消息内容增补请求对象。
@@ -427,6 +433,7 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
 
                     # 永久二维码的`scene_id`作为`params`供客户使用。
                     req.params.scene_id = query.scene_id
+                    _(req.query).extend(query)
                     req.url += "&" + qs.stringify(query)
 
                     # 调用扫码处理句柄参数为：
@@ -468,6 +475,7 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
                 # 无桌面端关注时，如已注册处理句柄，
                 # 将二维码的查询参数增补至请求对象查询参数中，在当前进程内处理。
                 else if scan_handlers[name]
+                  _(req.query).extend(query)
                   req.url += "&" + qs.stringify(query)
                   async.eachSeries scan_handlers[name], (scan_handler, callback) ->
                     scan_handler req, res, (->), callback
@@ -628,16 +636,22 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
         if populate_user and message.event?.toLowerCase() not in ['unsubscribe']
           wx.user message.from_user_name, (err, user) ->
             if err
-              console.error err
+              console.error err if debug
               if err.errcode == 40001 || err.errcode == 42001
-                 redis_client.del 'WX:ACCESS_TOKEN'
-                 fetch_access_token()
-              return res.status(500).end()
+                 redis_client.del key_access_token
+                 fetch_access_token()              
+              return process_message wx.user message.from_user_name
             process_message user
 
         # 禁用自动组装时，用仅带编号的用户替代。
         else
           process_message wx.user message.from_user_name
+
+      # 如果存在密钥，就进行解密
+      if encoding_aes_key
+        wx_msg_crypt.decrypt string, callback
+      else
+        xml2js.parseString string, callback
 
   # ### 媒体标识符格式
   regex_media_id = /^[\w\_\-]{64}$/
@@ -669,13 +683,22 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
     # + 发送方用户名；
     # + 接收方用户名；
     # + 消息创建时间。
-    message = (message) ->
-      "<xml>
-      <ToUserName><![CDATA[#{req.from_user_name}]]></ToUserName>
-      <FromUserName><![CDATA[#{req.to_user_name}]]></FromUserName>
-      <CreateTime>#{~~(Date.now() / 1000)}</CreateTime>
-      #{message}
-      </xml>"
+    if encoding_aes_key
+      message = (message) ->
+        wx_msg_crypt.encrypt "<xml>
+          <ToUserName><![CDATA[#{req.from_user_name}]]></ToUserName>
+          <FromUserName><![CDATA[#{req.to_user_name}]]></FromUserName>
+          <CreateTime>#{~~(Date.now() / 1000)}</CreateTime>
+          #{message}
+          </xml>", req.query.timestamp, req.query.nonce
+    else
+      message = (message) ->
+        "<xml>
+        <ToUserName><![CDATA[#{req.from_user_name}]]></ToUserName>
+        <FromUserName><![CDATA[#{req.to_user_name}]]></FromUserName>
+        <CreateTime>#{~~(Date.now() / 1000)}</CreateTime>
+        #{message}
+        </xml>"
 
     # ### 回复文本
     text: (text) ->
@@ -772,8 +795,8 @@ module.exports = ({token, app_id, app_secret, redis_options, populate_user, debu
 
     # 响应设备发来的消息
     device: (content) ->
-      content = base64.encode(content)
-      
+      content = (new Buffer(content)).toString('base64')
+
       @send message "<MsgType><![CDATA[device_text]]></MsgType>
         <DeviceType><![CDATA[#{req.device_type}]]></DeviceType>
         <DeviceID><![CDATA[#{req.device_id}]]></DeviceID>
